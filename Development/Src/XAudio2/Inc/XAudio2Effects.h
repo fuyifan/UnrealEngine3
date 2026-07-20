@@ -26,13 +26,6 @@ public:
 	UBOOL CreateReverbVoice( class UXAudio2Device* XAudio2Device );
 
 	/** 
-     * Create a voice that pipes the radio sounds to the master output
-	 *
-	 * @param	XAudio2Device	The audio device used by the engine.
-	 */
-	UBOOL CreateRadioVoice( class UXAudio2Device* XAudio2Device );
-
-	/** 
 	 * Calls the platform specific code to set the parameters that define reverb
 	 */
 	virtual void SetReverbEffectParameters( const FAudioReverbEffect& ReverbEffectParameters );
@@ -41,13 +34,6 @@ public:
 	 * Calls the platform specific code to set the parameters that define EQ
 	 */
 	virtual void SetEQEffectParameters( const FAudioEQEffect& ReverbEffectParameters );
-
-	/** 
-	 * Calls the platform specific code to set the parameters that define a radio effect.
-	 * 
-	 * @param	RadioEffectParameters	The new parameters for the radio distortion effect. 
-	 */
-	virtual void SetRadioEffectParameters( const FAudioRadioEffect& RadioEffectParameters );
 
 private:
 	/** 
@@ -59,8 +45,6 @@ private:
 	IUnknown*					ReverbEffect;
 	/** EQ effect */
 	IUnknown*					EQEffect;
-	/** Radio effect */
-	IUnknown*					RadioEffect;
 
 	/** For receiving 6 channels of audio that will have no EQ applied */
 	IXAudio2SubmixVoice*		DryPremasterVoice;
@@ -68,8 +52,6 @@ private:
 	IXAudio2SubmixVoice*		EQPremasterVoice;
 	/** For receiving audio that will have reverb applied */
 	IXAudio2SubmixVoice*		ReverbEffectVoice;
-	/** For receiving audio that will have radio effect applied */
-	IXAudio2SubmixVoice*		RadioEffectVoice;
 
 	friend class UXAudio2Device;
 	friend class FXAudio2SoundSource;

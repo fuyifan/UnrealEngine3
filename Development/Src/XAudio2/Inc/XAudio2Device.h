@@ -30,7 +30,6 @@
 enum ProcessingStages
 {
 	STAGE_SOURCE = 1,
-	STAGE_RADIO,
 	STAGE_REVERB,
 	STAGE_EQPREMASTER,
 	STAGE_OUTPUT
@@ -40,7 +39,6 @@ enum SourceDestinations
 {
 	DEST_DRY,
 	DEST_REVERB,
-	DEST_RADIO,
 	DEST_COUNT
 };
 
@@ -54,7 +52,6 @@ enum ChannelOutputs
 	CHANNELOUT_RIGHTSURROUND,
 
 	CHANNELOUT_REVERB,
-	CHANNELOUT_RADIO,
 	CHANNELOUT_COUNT
 };
 
@@ -390,30 +387,12 @@ public:
 	 */
 	void RouteToReverb( FLOAT ChannelVolumes[CHANNELOUT_COUNT] );
 
-	/** 
-	 * Maps the sound to the relevant radio effect.
-	 *
-	 * @param	ChannelVolumes	The volumes associated to each channel. 
-	 *							Note: Not all channels are mapped directly to a speaker.
-	 */
-	void RouteToRadio( FLOAT ChannelVolumes[CHANNELOUT_COUNT] );
-
 protected:
 	/** Decompress through XAudio2Buffer, or call USoundNodeWave procedure to generate more PCM data. Returns true/false: did audio loop? */
 	UBOOL ReadMorePCMData(const INT BufferIndex);
 
 	/** Handle obtaining more data for procedural USoundNodeWaves. Always returns FALSE for convenience. */
 	UBOOL ReadProceduralData(const INT BufferIndex);
-
-	/**
-	 * Utility function for determining the proper index of an effect. Certain effects (such as: reverb and radio distortion) 
-	 * are optional. Thus, they may be NULL, yet XAudio2 cannot have a NULL output voice in the send list for this source voice.
-	 *
-	 * @return	The index of the destination XAudio2 submix voice for the given effect; -1 if effect not in destination array. 
-	 *
-	 * @param	Effect	The effect type's (Reverb, Radio Distoriton, etc) index to find. 
-	 */
-	INT GetDestinationVoiceIndexForEffect( SourceDestinations Effect );
 
 	/** Owning classes */
 	UXAudio2Device*				AudioDevice;

@@ -12,7 +12,6 @@
 
 #include "Engine.h"
 
-#include <xapobase.h>
 #include <xapofx.h>
 #include <xaudio2fx.h>
 

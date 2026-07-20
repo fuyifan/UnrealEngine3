@@ -62,8 +62,6 @@ FXAudio2SoundSource::FXAudio2SoundSource( UAudioDevice* InAudioDevice, FAudioEff
 	Destinations[DEST_DRY].pOutputVoice = NULL;
 	Destinations[DEST_REVERB].Flags = 0;
 	Destinations[DEST_REVERB].pOutputVoice = NULL;
-	Destinations[DEST_RADIO].Flags = 0;
-	Destinations[DEST_RADIO].pOutputVoice = NULL;
 
 	appMemzero( XAudio2Buffers, sizeof( XAudio2Buffers ) );
 	appMemzero( XAudio2BufferXWMA, sizeof( XAudio2BufferXWMA ) );
@@ -307,12 +305,6 @@ UBOOL FXAudio2SoundSource::CreateSource( void )
 		NumSends++;
 	}
 
-	if( WaveInstance->bApplyRadioFilter && Effects->RadioEffectVoice )
-	{
-		Destinations[NumSends].pOutputVoice = Effects->RadioEffectVoice;
-		NumSends++;
-	}
-
 	const XAUDIO2_VOICE_SENDS SourceSendList =
 	{
 		NumSends, Destinations
@@ -448,20 +440,11 @@ void FXAudio2SoundSource::GetChannelVolumes( FLOAT ChannelVolumes[CHANNELOUT_COU
 				ChannelVolumes[CHANNELOUT_REVERB] = AttenuatedVolume;
 			}
 
-			ChannelVolumes[CHANNELOUT_RADIO] = 0.0f;
-
-			// Call the spatialisation magic
+		// Call the spatialisation magic
 			SpatializationHelper.CalculateDolbySurroundRate( OrientFront, ListenerPosition, EmitterPosition, NormalizedOmniRadius, ChannelVolumes );
 
 			// Handle any special post volume processing
-			if( WaveInstance->bApplyRadioFilter )
-			{
-				// If radio filter applied, output on radio channel only (no reverb)
-				appMemzero( ChannelVolumes, CHANNELOUT_COUNT * sizeof( FLOAT ) );
-
-				ChannelVolumes[CHANNELOUT_RADIO] = WaveInstance->RadioFilterVolume;	
-			}
-			else if( WaveInstance->bCenterChannelOnly )
+			if( WaveInstance->bCenterChannelOnly )
 			{
 				// If center channel only applied, output on center channel only (no reverb)
 				appMemzero( ChannelVolumes, CHANNELOUT_COUNT * sizeof( FLOAT ) );
@@ -514,12 +497,6 @@ void FXAudio2SoundSource::GetChannelVolumes( FLOAT ChannelVolumes[CHANNELOUT_COU
 				ChannelVolumes[CHANNELOUT_REVERB] = AttenuatedVolume;
 			}
 
-			// Handle radio distortion if the sound can handle it. 
-			ChannelVolumes[CHANNELOUT_RADIO] = 0.0f;
-			if( WaveInstance->bApplyRadioFilter )
-			{
-				ChannelVolumes[CHANNELOUT_RADIO] = WaveInstance->RadioFilterVolume;
-			}
 		}
 		break;
 
@@ -564,7 +541,6 @@ void FXAudio2SoundSource::GetChannelVolumes( FLOAT ChannelVolumes[CHANNELOUT_COU
 
 	case DEBUGSTATE_IsolateDryAudio:
 		ChannelVolumes[CHANNELOUT_REVERB] = 0.0f;
-		ChannelVolumes[CHANNELOUT_RADIO] = 0.0f;
 		break;
 	};
 
@@ -703,107 +679,6 @@ void FXAudio2SoundSource::RouteToReverb( FLOAT ChannelVolumes[CHANNELOUT_COUNT] 
 	}
 }
 
-/** 
- * Maps the sound to the relevant radio effect.
- *
- * @param	ChannelVolumes	The volumes associated to each channel. 
- *							Note: Not all channels are mapped directly to a speaker.
- */
-void FXAudio2SoundSource::RouteToRadio( FLOAT ChannelVolumes[CHANNELOUT_COUNT] )
-{
-	// Radio distortion must be applied to process this function because 
-	// the index of the destination output voice would be incorrect. 
-	check( WaveInstance->bApplyRadioFilter );
-
-	// Get the index for the radio voice because it doesn't 
-	// necessarily match up to the enum value for radio.
-	const INT Index = GetDestinationVoiceIndexForEffect( DEST_RADIO );
-
-	// If the index is -1, something changed with the Destinations array or 
-	// SourceDestinations enum without an update to GetDestinationIndexForEffect().
-	check( Index != -1 );
-
-	// NOTE: The radio-distorted audio will only get routed to the center speaker.
-	switch( Buffer->NumChannels )
-	{
-	case 1:
-		{
-			// Audio maps 1 channel to 6 speakers
-			FLOAT OutputMatrix[SPEAKER_COUNT * 1] = 
-			{		
-				0.0f,
-				0.0f,
-				ChannelVolumes[CHANNELOUT_RADIO],
-				0.0f,
-				0.0f,
-				0.0f,
-			};
-
-			// Mono sounds map 1 channel to 6 speakers.
-			AudioDevice->ValidateAPICall( TEXT( "SetOutputMatrix (Mono radio)" ), 
-				Source->SetOutputMatrix( Destinations[Index].pOutputVoice, 1, SPEAKER_COUNT, OutputMatrix ) );
-		}
-		break;
-
-	case 2:
-		{
-			// Audio maps 2 channels to 6 speakers
-			FLOAT OutputMatrix[SPEAKER_COUNT * 2] = 
-			{			
-				0.0f, 0.0f,
-				0.0f, 0.0f,
-				ChannelVolumes[CHANNELOUT_RADIO], ChannelVolumes[CHANNELOUT_RADIO],
-				0.0f, 0.0f,
-				0.0f, 0.0f,
-				0.0f, 0.0f,
-			};
-
-			// Stereo sounds map 2 channels to 6 speakers.
-			AudioDevice->ValidateAPICall( TEXT( "SetOutputMatrix (Stereo radio)" ), 
-				Source->SetOutputMatrix( Destinations[Index].pOutputVoice, 2, SPEAKER_COUNT, OutputMatrix ) );
-		}
-		break;
-	}
-}
-
-
-/**
- * Utility function for determining the proper index of an effect. Certain effects (such as: reverb and radio distortion) 
- * are optional. Thus, they may be NULL, yet XAudio2 cannot have a NULL output voice in the send list for this source voice.
- *
- * @return	The index of the destination XAudio2 submix voice for the given effect; -1 if effect not in destination array. 
- *
- * @param	Effect	The effect type's (Reverb, Radio Distoriton, etc) index to find. 
- */
-INT FXAudio2SoundSource::GetDestinationVoiceIndexForEffect( SourceDestinations Effect )
-{
-	INT Index = -1;
-
-	switch( Effect )
-	{
-	case DEST_DRY:
-		// The dry mix is ALWAYS the first voice because always set it. 
-		Index = 0;
-		break;
-
-	case DEST_REVERB:
-		// If reverb is applied, then it comes right after the dry mix.
-		Index = bReverbApplied ? DEST_REVERB : -1;
-		break;
-
-	case DEST_RADIO:
-		// If radio distortion is applied, it depends on if there is 
-		// reverb in the chain. Radio will always come after reverb.
-		Index = ( WaveInstance->bApplyRadioFilter && Effects->RadioEffectVoice ) ? ( bReverbApplied ? DEST_RADIO : DEST_REVERB ) : -1;
-		break;
-
-	default:
-		Index = -1;
-	}
-
-	return Index;
-}
-
 /**
  * Callback to let the sound system know the sound has looped
  */
@@ -871,12 +746,6 @@ void FXAudio2SoundSource::Update( void )
 		RouteToReverb( ChannelVolumes );
 	}
 
-	// If this audio can have radio distortion applied, 
-	// send the volumes to the radio distortion voice. 
-	if( WaveInstance->bApplyRadioFilter && Effects->RadioEffectVoice )
-	{
-		RouteToRadio( ChannelVolumes );
-	}
 }
 
 /**
