@@ -113,10 +113,11 @@ public:
 -----------------------------------------------------------------------------*/
 static FBandPassFilter      GFinalBandPassFilter;
 
-/*-----------------------------------------------------------------------------
+/*----------------------------------------------------------------------------- 
 	FXAudio2RadioEffect. Custom XAPO for radio distortion.
 -----------------------------------------------------------------------------*/
 
+#if 0
 #define RADIO_CLASS_ID __declspec( uuid( "{5EB8D611-FF96-429d-8365-2DDF89A7C1CD}" ) ) 
 
 /**
@@ -297,6 +298,7 @@ XAPO_REGISTRATION_PROPERTIES FXAudio2RadioEffect::Registration =
 								| XAPO_FLAG_INPLACE_SUPPORTED,
 	1, 1, 1, 1
 };
+#endif
 
 /*------------------------------------------------------------------------------------
 	FXeAudioEffectsManager.
@@ -426,47 +428,9 @@ UBOOL FXAudio2EffectsManager::CreateReverbVoice( UXAudio2Device* XAudio2Device )
  */
 UBOOL FXAudio2EffectsManager::CreateRadioVoice( class UXAudio2Device* XAudio2Device )
 {
-	// Grab the sample rate, which is needed to configure the radio distortion effect settings.
-	const DWORD SampleRate = XAudio2Device->DeviceDetails.OutputFormat.Format.nSamplesPerSec;
-	
-	// Create the custom XAPO radio distortion effect
-	FXAudio2RadioEffect* NewRadioEffect = new FXAudio2RadioEffect( SampleRate );
-	NewRadioEffect->Initialize( NULL, 0 );
-	RadioEffect = ( IXAPO* )NewRadioEffect;
-
-	// Define the effect chain that will be applied to 
-	// the submix voice dedicated to radio distortion.
-	const UBOOL bRadioEffectEnabled = TRUE;
-	const INT	OutputChannelCount	= SPEAKER_COUNT;
-
-	XAUDIO2_EFFECT_DESCRIPTOR RadioEffects[] =
-	{
-		{ RadioEffect, bRadioEffectEnabled, OutputChannelCount }
-	};
-
-	XAUDIO2_EFFECT_CHAIN RadioEffectChain =
-	{
-		1, RadioEffects
-	};
-
-	// Finally, create the submix voice that holds the radio effect. Sounds (source voices) 
-	// will be piped to this submix voice to receive radio distortion. 
-	if( !AudioDevice->ValidateAPICall( TEXT( "CreateSubmixVoice (Radio)" ), 
-		XAudio2Device->XAudio2->CreateSubmixVoice( &RadioEffectVoice, OutputChannelCount, SampleRate, 0, STAGE_RADIO, NULL, &RadioEffectChain ) ) )
-	{
-		return FALSE;
-	}
-
-	const DWORD NumChannels = XAudio2Device->DeviceDetails.OutputFormat.Format.nChannels;
-	UXAudio2Device::GetOutputMatrix( XAudio2Device->DeviceDetails.OutputFormat.dwChannelMask, NumChannels );
-
-	// Designate the radio-distorted audio to route to the master voice.
-	if( !AudioDevice->ValidateAPICall( TEXT( "SetOutputMatrix (Radio)" ), 
-		RadioEffectVoice->SetOutputMatrix( NULL, SPEAKER_COUNT, NumChannels, UXAudio2Device::OutputMixMatrix ) ) )
-	{
-		return FALSE;
-	}
-
+	// Radio XAPO processing is disabled. Do not create a radio submix voice.
+	RadioEffect = NULL;
+	RadioEffectVoice = NULL;
 	return TRUE;
 }
 
@@ -608,8 +572,6 @@ void FXAudio2EffectsManager::SetEQEffectParameters( const FAudioEQEffect& EQEffe
  */
 void FXAudio2EffectsManager::SetRadioEffectParameters( const FAudioRadioEffect& RadioEffectParameters ) 
 {
-	AudioDevice->ValidateAPICall( TEXT( "SetEffectParameters (Radio)" ), 
-		RadioEffectVoice->SetEffectParameters( 0, &RadioEffectParameters, sizeof( RadioEffectParameters ) ) );
+	// Radio processing is disabled. Ignoring radio parameter updates.
 }
 
-// end

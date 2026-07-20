@@ -307,7 +307,7 @@ UBOOL FXAudio2SoundSource::CreateSource( void )
 		NumSends++;
 	}
 
-	if( WaveInstance->bApplyRadioFilter )
+	if( WaveInstance->bApplyRadioFilter && Effects->RadioEffectVoice )
 	{
 		Destinations[NumSends].pOutputVoice = Effects->RadioEffectVoice;
 		NumSends++;
@@ -794,7 +794,7 @@ INT FXAudio2SoundSource::GetDestinationVoiceIndexForEffect( SourceDestinations E
 	case DEST_RADIO:
 		// If radio distortion is applied, it depends on if there is 
 		// reverb in the chain. Radio will always come after reverb.
-		Index = ( WaveInstance->bApplyRadioFilter ) ? ( bReverbApplied ? DEST_RADIO : DEST_REVERB ) : -1;
+		Index = ( WaveInstance->bApplyRadioFilter && Effects->RadioEffectVoice ) ? ( bReverbApplied ? DEST_RADIO : DEST_REVERB ) : -1;
 		break;
 
 	default:
@@ -873,7 +873,7 @@ void FXAudio2SoundSource::Update( void )
 
 	// If this audio can have radio distortion applied, 
 	// send the volumes to the radio distortion voice. 
-	if( WaveInstance->bApplyRadioFilter )
+	if( WaveInstance->bApplyRadioFilter && Effects->RadioEffectVoice )
 	{
 		RouteToRadio( ChannelVolumes );
 	}
