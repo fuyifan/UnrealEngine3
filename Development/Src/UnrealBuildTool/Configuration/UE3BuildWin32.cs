@@ -41,6 +41,7 @@ namespace UnrealBuildTool
 			GlobalCPPEnvironment.IncludePaths.Add("D3D11Drv/Inc");
 			GlobalCPPEnvironment.IncludePaths.Add("OpenGLDrv/Inc");
 			GlobalCPPEnvironment.IncludePaths.Add("XAudio2/Inc");
+			GlobalCPPEnvironment.IncludePaths.Add("ALAudio/Inc");
 			GlobalCPPEnvironment.IncludePaths.Add("Launch/Inc");
 			GlobalCPPEnvironment.IncludePaths.Add("../Tools/UnrealLightmass/Public");
 			GlobalCPPEnvironment.IncludePaths.Add("$(CommonProgramFiles)");
@@ -279,6 +280,10 @@ namespace UnrealBuildTool
             FinalLinkEnvironment.AdditionalLibraries.Add( "X3DAudio.lib" );
             FinalLinkEnvironment.AdditionalLibraries.Add( "xapobase.lib" );
             FinalLinkEnvironment.AdditionalLibraries.Add( "XAPOFX.lib" );
+
+			// OpenAL - ALAudio backend
+			FinalLinkEnvironment.AdditionalLibraries.Add( "OpenAL32.lib" );
+			FinalLinkEnvironment.DelayLoadDLLs.Add( "OpenAL32.dll" );
 
             if (!IsBuildingDedicatedServer() && !UE3BuildConfiguration.bCompileLeanAndMeanUE3)
 			{
@@ -599,6 +604,7 @@ namespace UnrealBuildTool
             {
 				NonGameProjects.Add(new UE3ProjectDesc("WinDrv/WinDrv.vcxproj"));
 				NonGameProjects.Add(new UE3ProjectDesc("XAudio2/XAudio2.vcxproj"));
+				NonGameProjects.Add(new UE3ProjectDesc("ALAudio/ALAudio.vcxproj"));
             }
             else
             {
@@ -607,6 +613,7 @@ namespace UnrealBuildTool
 				NonGameProjects.Add(new UE3ProjectDesc("OpenGLDrv/OpenGLDrv.vcxproj"));
 				NonGameProjects.Add(new UE3ProjectDesc("WinDrv/WinDrv.vcxproj"));
 				NonGameProjects.Add(new UE3ProjectDesc("XAudio2/XAudio2.vcxproj"));
+				NonGameProjects.Add(new UE3ProjectDesc("ALAudio/ALAudio.vcxproj"));
 
 				// OpenGL ES emulation support
 				if( Game.ShouldCompileES2() && File.Exists( "ES2Drv/ES2Drv.vcxproj" ) )
