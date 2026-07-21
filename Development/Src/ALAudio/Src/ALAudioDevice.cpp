@@ -32,6 +32,10 @@
 #include "UnAudioDecompress.h"
 #include <efx.h>
 
+// Windows MMDevice API for audio endpoint notifications
+#include <mmdeviceapi.h>
+#include <Functiondiscoverykeys_devpkey.h>
+
 #if SUPPORTS_PRAGMA_PACK
 #pragma pack( pop )
 #endif
@@ -50,6 +54,98 @@ FLOAT GALGlobalVolumeMultiplier = 1.0f;
 
 ALCdevice* UALAudioDevice::HardwareDevice = NULL;
 ALCcontext*	UALAudioDevice::SoundContext = NULL;
+
+
+/*=============================================================================
+	FALAudioNotificationClient - Windows MMDevice notification callback
+=============================================================================*/
+#if _WINDOWS
+
+FALAudioNotificationClient::FALAudioNotificationClient( UALAudioDevice* InDevice )
+	: AudioDevice( InDevice )
+	, RefCount( 1 )
+{
+}
+
+HRESULT STDMETHODCALLTYPE FALAudioNotificationClient::QueryInterface( REFIID Iid, void** OutObject )
+{
+	if( Iid == IID_IUnknown || Iid == __uuidof( IMMNotificationClient ) )
+	{
+		*OutObject = static_cast<IMMNotificationClient*>( this );
+		AddRef();
+		return S_OK;
+	}
+	*OutObject = NULL;
+	return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE FALAudioNotificationClient::AddRef()
+{
+	return (ULONG)appInterlockedIncrement( &RefCount );
+}
+
+ULONG STDMETHODCALLTYPE FALAudioNotificationClient::Release()
+{
+	LONG Count = appInterlockedDecrement( &RefCount );
+	if( Count == 0 )
+	{
+		delete this;
+	}
+	return (ULONG)Count;
+}
+
+HRESULT STDMETHODCALLTYPE FALAudioNotificationClient::OnDeviceStateChanged( LPCWSTR DeviceId, DWORD NewState )
+{
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Device state changed (state=%d)" ), NewState );
+
+	if( NewState == DEVICE_STATE_DISABLED || NewState == DEVICE_STATE_UNPLUGGED || NewState == DEVICE_STATE_NOTPRESENT )
+	{
+		// A device went away — flag for device lost check
+		AudioDevice->bDeviceLost = TRUE;
+		debugf( NAME_DevAudio, TEXT( "ALAudio: Device disabled/unplugged — marking as lost" ) );
+	}
+	else if( NewState == DEVICE_STATE_ACTIVE )
+	{
+		// A device became active — attempt recovery if we're in a lost state
+		debugf( NAME_DevAudio, TEXT( "ALAudio: Device became active — recovery may be possible" ) );
+	}
+	return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FALAudioNotificationClient::OnDeviceAdded( LPCWSTR DeviceId )
+{
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Device added" ) );
+	// New device available — may be useful for recovery if we were lost
+	return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FALAudioNotificationClient::OnDeviceRemoved( LPCWSTR DeviceId )
+{
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Device removed — marking as lost" ) );
+	AudioDevice->bDeviceLost = TRUE;
+	return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FALAudioNotificationClient::OnDefaultDeviceChanged( EDataFlow Flow, ERole Role, LPCWSTR DefaultDeviceId )
+{
+	if( Flow == eRender && Role == eConsole )
+	{
+		debugf( NAME_DevAudio, TEXT( "ALAudio: Default render device changed — triggering recovery" ) );
+		// The default device changed (e.g., headphones plugged in, USB DAC switched)
+		// This is the primary trigger for audio device recovery
+		AudioDevice->bDeviceLost = TRUE;
+	}
+	return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FALAudioNotificationClient::OnPropertyValueChanged( LPCWSTR DeviceId, const PROPERTYKEY Key )
+{
+	// Not typically relevant for audio playback
+	return S_OK;
+}
+
+#endif // _WINDOWS
+
 
 /*------------------------------------------------------------------------------------
 	UALAudioDevice constructor and UObject interface.
@@ -137,6 +233,10 @@ void UALAudioDevice::FinishDestroy( void )
 {
 	if( !HasAnyFlags( RF_ClassDefaultObject ) )
 	{
+#if _WINDOWS
+		// Unregister device notification before tearing down
+		ShutdownDeviceNotification();
+#endif
 		Teardown();
 		debugf( NAME_Exit, TEXT( "OpenAL Audio Device shut down." ) );
 	}
@@ -219,6 +319,14 @@ UBOOL UALAudioDevice::Init( void )
 	// Make sure no interface classes contain any garbage
 	Effects = NULL;
 	DLLHandle = NULL;
+
+#if _WINDOWS
+	// Initialize device notification state
+	MMDeviceEnumerator = NULL;
+	NotificationClient = NULL;
+	bDeviceLost = FALSE;
+	bRecovering = FALSE;
+#endif
 
 	// Default to sensible channel count.
 	if( MaxChannels < 1 )
@@ -349,6 +457,11 @@ UBOOL UALAudioDevice::Init( void )
 	// Initialized.
 	NextResourceID = 1;
 
+#if _WINDOWS
+	// Register for device change notifications on Windows
+	InitDeviceNotification();
+#endif
+
 	// Initialize base class last as it's going to precache already loaded audio.
 	Super::Init();
 
@@ -357,7 +470,8 @@ UBOOL UALAudioDevice::Init( void )
 
 /**
  * Update the audio device and calculates the cached inverse transform later
- * on used for spatialization.
+ * on used for spatialization. On Windows, also checks for device lost and
+ * triggers recovery.
  *
  * @param	Realtime	whether we are paused or not
  */
@@ -369,6 +483,28 @@ void UALAudioDevice::Update( UBOOL Realtime )
 		return;
 	}
 #endif
+
+#if _WINDOWS
+	// ---- Device lost detection and recovery ----
+	if( bDeviceLost && !bRecovering )
+	{
+		// Attempt to recover the audio device
+		AttemptDeviceRecovery();
+	}
+	else if( !bDeviceLost && !bRecovering )
+	{
+		// Periodically check if the device is still connected
+		CheckDeviceLost();
+	}
+
+	// If we're in the middle of recovery or the device is still lost,
+	// skip normal audio update (OpenAL calls would fail)
+	if( bRecovering || bDeviceLost )
+	{
+		return;
+	}
+#endif
+
 	Super::Update( Realtime );
 
 	// Set Player position
@@ -411,6 +547,15 @@ void UALAudioDevice::Update( UBOOL Realtime )
  */
 void UALAudioDevice::Precache( USoundNodeWave* Wave )
 {
+#if _WINDOWS
+	// Don't try to precache while recovering — buffers will be re-uploaded
+	// during the recovery process
+	if( bRecovering || bDeviceLost )
+	{
+		return;
+	}
+#endif
+
 	FALSoundBuffer::Init( Wave, this );
 
 	// If it's not native, then it will remain compressed
@@ -539,6 +684,450 @@ ALuint UALAudioDevice::GetInternalFormat( INT NumChannels )
 	return( InternalFormat );
 }
 
+
+/*------------------------------------------------------------------------------------
+	Windows device lost detection and recovery implementation
+------------------------------------------------------------------------------------*/
+#if _WINDOWS
+
+/**
+ * Initializes the COM MMDeviceEnumerator and registers for endpoint
+ * notification callbacks. Called from Init() on Windows.
+ */
+void UALAudioDevice::InitDeviceNotification( void )
+{
+	// Initialize COM on this thread (may already be initialized)
+	CoInitializeEx( NULL, COINIT_MULTITHREADED );
+
+	HRESULT hr = CoCreateInstance(
+		__uuidof(MMDeviceEnumerator),
+		NULL,
+		CLSCTX_INPROC_SERVER,
+		__uuidof(IMMDeviceEnumerator),
+		(void**)&MMDeviceEnumerator
+	);
+
+	if( FAILED( hr ) )
+	{
+		debugf( NAME_Init, TEXT( "ALAudio: Failed to create MMDeviceEnumerator (hr=0x%08X) — device notifications disabled" ), hr );
+		MMDeviceEnumerator = NULL;
+		return;
+	}
+
+	// Create the notification client
+	NotificationClient = new FALAudioNotificationClient( this );
+
+	// Register for endpoint notifications
+	hr = MMDeviceEnumerator->RegisterEndpointNotificationCallback( NotificationClient );
+	if( FAILED( hr ) )
+	{
+		debugf( NAME_Init, TEXT( "ALAudio: Failed to register endpoint notification callback (hr=0x%08X)" ), hr );
+		NotificationClient->Release();
+		NotificationClient = NULL;
+		MMDeviceEnumerator->Release();
+		MMDeviceEnumerator = NULL;
+	}
+	else
+	{
+		debugf( NAME_Init, TEXT( "ALAudio: Device notification client registered successfully" ) );
+	}
+}
+
+/**
+ * Unregisters notification callbacks and releases COM interfaces.
+ * Called from FinishDestroy() on Windows.
+ */
+void UALAudioDevice::ShutdownDeviceNotification( void )
+{
+	if( MMDeviceEnumerator && NotificationClient )
+	{
+		MMDeviceEnumerator->UnregisterEndpointNotificationCallback( NotificationClient );
+		NotificationClient->Release();
+		NotificationClient = NULL;
+	}
+
+	if( MMDeviceEnumerator )
+	{
+		MMDeviceEnumerator->Release();
+		MMDeviceEnumerator = NULL;
+	}
+
+	CoUninitialize();
+}
+
+/**
+ * Called each frame from Update() to check whether the OpenAL device
+ * has been disconnected. Uses the ALC_EXT_disconnect extension if available,
+ * otherwise falls back to checking for AL_INVALID_OPERATION errors.
+ */
+void UALAudioDevice::CheckDeviceLost( void )
+{
+	if( !HardwareDevice || !SoundContext )
+	{
+		bDeviceLost = TRUE;
+		return;
+	}
+
+	// Try to use the ALC_EXT_disconnect extension to check device connectivity
+	// This is the most reliable way to detect device loss
+	if( alcIsExtensionPresent( HardwareDevice, "ALC_EXT_disconnect" ) )
+	{
+		ALCint Connected = ALC_FALSE;
+		alcGetIntegerv( HardwareDevice, ALC_CONNECTED, 1, &Connected );
+		if( !Connected )
+		{
+			debugf( NAME_DevAudio, TEXT( "ALAudio: ALC_CONNECTED returned FALSE — device is lost!" ) );
+			bDeviceLost = TRUE;
+			return;
+		}
+	}
+
+	// Fallback: check if the context is still valid by trying a no-op operation
+	// If alGetError returns an error, the context is likely broken
+	alGetError(); // Clear error stack
+	ALint DummyState;
+	alGetSourcei( 0, AL_SOURCE_STATE, &DummyState ); // Will fail with INVALID_NAME normally, but INVALID_OPERATION means lost context
+	ALenum Err = alGetError();
+	if( Err == AL_INVALID_OPERATION )
+	{
+		debugf( NAME_DevAudio, TEXT( "ALAudio: AL_INVALID_OPERATION on context check — device is lost!" ) );
+		bDeviceLost = TRUE;
+	}
+}
+
+/**
+ * Releases the OpenAL device and context without tearing down the
+ * Unreal-side source/buffer data structures. Used during device loss
+ * to gracefully detach from the hardware while preserving the data
+ * needed for recovery.
+ */
+void UALAudioDevice::ReleaseALHardware( void )
+{
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Releasing OpenAL hardware (device lost)" ) );
+
+	// Stop all playing sources but keep the FALSoundSource objects
+	for( INT i = 0; i < Sources.Num(); i++ )
+	{
+		FALSoundSource* Source = (FALSoundSource*)Sources(i);
+		if( Source )
+		{
+			// Stop any current playback without calling OpenAL (it would fail)
+			Source->Playing = FALSE;
+			Source->Paused = FALSE;
+			Source->WaveInstance = NULL;
+			Source->Buffer = NULL;
+		}
+	}
+
+	// Clear the free sources list — sources will be re-queued after recovery
+	FreeSources.Empty();
+
+	// Delete all AL source IDs (the hardware is going away anyway)
+	for( INT i = 0; i < Sources.Num(); i++ )
+	{
+		FALSoundSource* Source = (FALSoundSource*)Sources(i);
+		if( Source )
+		{
+			// Don't call alDeleteSources — the context is invalid
+			// Just mark the source ID as invalid
+			Source->SourceId = 0;
+		}
+	}
+
+	// Detach context
+	if( alcMakeContextCurrent )
+	{
+		alcMakeContextCurrent( NULL );
+	}
+
+	// Destroy context
+	if( alcDestroyContext && SoundContext )
+	{
+		alcDestroyContext( SoundContext );
+		SoundContext = NULL;
+	}
+
+	// Close device
+	if( alcCloseDevice && HardwareDevice )
+	{
+		alcCloseDevice( HardwareDevice );
+		HardwareDevice = NULL;
+	}
+}
+
+/**
+ * Re-opens the OpenAL device and context, and recreates all AL sources.
+ * Reuses existing FALSoundSource objects but assigns them new SourceIds.
+ *
+ * @return TRUE if hardware re-initialization succeeded, FALSE otherwise
+ */
+UBOOL UALAudioDevice::RecreateALHardware( void )
+{
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Recreating OpenAL hardware..." ) );
+
+	// Re-open device — pass NULL to get the current default device (which
+	// may have changed, e.g., new headphones were plugged in)
+	HardwareDevice = alcOpenDevice( NULL );
+	if( !HardwareDevice )
+	{
+		debugf( NAME_Error, TEXT( "ALAudio: Failed to re-open default audio device" ) );
+		return FALSE;
+	}
+
+	const ALCchar* OpenedDeviceName = alcGetString( HardwareDevice, ALC_DEVICE_SPECIFIER );
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Re-opened device: %s" ), ANSI_TO_TCHAR( OpenedDeviceName ) );
+
+	// Create a new context with the same capabilities
+	INT Caps[] = 
+	{ 
+		ALC_FREQUENCY, 44100, 
+		ALC_MAX_AUXILIARY_SENDS, 5, 
+		ALC_STEREO_SOURCES, 4, 
+		0, 0 };
+	SoundContext = alcCreateContext( HardwareDevice, Caps );
+	if( !SoundContext )
+	{
+		debugf( NAME_Error, TEXT( "ALAudio: Failed to create new audio context" ) );
+		alcCloseDevice( HardwareDevice );
+		HardwareDevice = NULL;
+		return FALSE;
+	}
+
+	alcMakeContextCurrent( SoundContext );
+
+	if( alError( TEXT( "RecreateALHardware" ), 0 ) )
+	{
+		debugf( NAME_Error, TEXT( "ALAudio: Error making new context current" ) );
+		alcDestroyContext( SoundContext );
+		SoundContext = NULL;
+		alcCloseDevice( HardwareDevice );
+		HardwareDevice = NULL;
+		return FALSE;
+	}
+
+	debugf( NAME_DevAudio, TEXT( "ALAudio: New context created successfully" ) );
+	debugf( NAME_DevAudio, TEXT( "AL_VENDOR      : %s" ), ANSI_TO_TCHAR( ( ANSICHAR* )alGetString( AL_VENDOR ) ) );
+	debugf( NAME_DevAudio, TEXT( "AL_RENDERER    : %s" ), ANSI_TO_TCHAR( ( ANSICHAR* )alGetString( AL_RENDERER ) ) );
+	debugf( NAME_DevAudio, TEXT( "AL_VERSION     : %s" ), ANSI_TO_TCHAR( ( ANSICHAR* )alGetString( AL_VERSION ) ) );
+
+	// Re-acquire multichannel format enums (may differ between devices)
+	Surround40Format = alGetEnumValue( "AL_FORMAT_QUAD16" );
+	Surround51Format = alGetEnumValue( "AL_FORMAT_51CHN16" );
+	Surround61Format = alGetEnumValue( "AL_FORMAT_61CHN16" );
+	Surround71Format = alGetEnumValue( "AL_FORMAT_71CHN16" );
+
+	// Re-apply distance model
+	alDistanceModel( AL_NONE );
+
+	// Re-generate AL source IDs for all existing FALSoundSource objects
+	alError( TEXT( "Emptying error stack before source recreation" ), 0 );
+	for( INT i = 0; i < Sources.Num(); i++ )
+	{
+		FALSoundSource* Source = (FALSoundSource*)Sources(i);
+		if( Source )
+		{
+			ALuint NewSourceId;
+			alGenSources( 1, &NewSourceId );
+			if( !alError( TEXT( "Recreate sources" ), 0 ) )
+			{
+				Source->SourceId = NewSourceId;
+				FreeSources.AddItem( Source );
+			}
+			else
+			{
+				debugf( NAME_Error, TEXT( "ALAudio: Failed to recreate source %d/%d" ), i+1, Sources.Num() );
+				// Continue with however many we could create
+				break;
+			}
+		}
+	}
+
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Recreated %d/%d sources" ), FreeSources.Num(), Sources.Num() );
+
+	if( FreeSources.Num() < 1 )
+	{
+		debugf( NAME_Error, TEXT( "ALAudio: Failed to recreate any sources" ) );
+		alcDestroyContext( SoundContext );
+		SoundContext = NULL;
+		alcCloseDevice( HardwareDevice );
+		HardwareDevice = NULL;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/**
+ * Re-uploads all cached FALSoundBuffer data to the new OpenAL context
+ * after recovery. Iterates all USoundNodeWave objects to find the ones
+ * whose buffer data needs re-uploading.
+ */
+void UALAudioDevice::ReuploadAllBuffers( void )
+{
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Re-uploading %d buffers..." ), Buffers.Num() );
+
+	// Clear the existing WaveBufferMap — all entries have invalid AL buffer IDs
+	// We'll rebuild it as we re-upload
+	WaveBufferMap.Empty();
+
+	// Iterate all USoundNodeWave objects to find ones that had buffers
+	// and re-upload their PCM data
+	for( TObjectIterator<USoundNodeWave> It; It; ++It )
+	{
+		USoundNodeWave* Wave = *It;
+		if( Wave && Wave->ResourceID > 0 && Wave->NumChannels > 0 )
+		{
+			// Find the corresponding FALSoundBuffer by resource ID
+			FALSoundBuffer* Buffer = NULL;
+			for( INT i = 0; i < Buffers.Num(); i++ )
+			{
+				if( Buffers(i)->ResourceID == Wave->ResourceID )
+				{
+					Buffer = Buffers(i);
+					break;
+				}
+			}
+
+			if( Buffer )
+			{
+				// Generate new AL buffer IDs
+				alGenBuffers( 1, Buffer->BufferIds );
+				if( alError( TEXT( "ReuploadAllBuffers (gen)" ), 0 ) )
+				{
+					debugf( NAME_Error, TEXT( "ALAudio: Failed to gen buffer for '%s'" ), *Wave->GetName() );
+					continue;
+				}
+
+				// Re-upload the PCM data using the same logic as FALSoundBuffer::Init
+				if( Wave->RawPCMData )
+				{
+					// Raw PCM data is still available
+					Buffer->InternalFormat = GetInternalFormat( Wave->NumChannels );
+					Buffer->NumChannels = Wave->NumChannels;
+					Buffer->SampleRate = Wave->SampleRate;
+
+					alBufferData( Buffer->BufferIds[0], Buffer->InternalFormat, Wave->RawPCMData, Wave->RawPCMDataSize, Buffer->SampleRate );
+				}
+				else
+				{
+					// Try to get data from the bulk data store
+					BYTE* SoundData = (BYTE*)Wave->RawData.Lock( LOCK_READ_ONLY );
+					INT SoundDataSize = Wave->RawData.GetBulkDataSize();
+
+					FWaveModInfo WaveInfo;
+					if( WaveInfo.ReadWaveInfo( SoundData, SoundDataSize ) )
+					{
+						SoundData = WaveInfo.SampleDataStart;
+						SoundDataSize = WaveInfo.SampleDataSize;
+					}
+
+					Buffer->InternalFormat = GetInternalFormat( Wave->NumChannels );
+					Buffer->NumChannels = Wave->NumChannels;
+					Buffer->SampleRate = Wave->SampleRate;
+
+					alBufferData( Buffer->BufferIds[0], Buffer->InternalFormat, SoundData, SoundDataSize, Buffer->SampleRate );
+					Wave->RawData.Unlock();
+				}
+
+				if( alError( TEXT( "ReuploadAllBuffers (data)" ), 0 ) || Buffer->InternalFormat == 0 )
+				{
+					debugf( NAME_Warning, TEXT( "ALAudio: Failed to re-upload buffer for '%s'" ), *Wave->GetName() );
+					alDeleteBuffers( 1, Buffer->BufferIds );
+					Buffer->BufferIds[0] = 0;
+					Buffer->BufferIds[1] = 0;
+					continue;
+				}
+
+				// Re-register in the wave buffer map
+				WaveBufferMap.Set( Buffer->ResourceID, Buffer );
+
+				debugf( NAME_DevAudio, TEXT( "ALAudio: Re-uploaded buffer for '%s' (%d bytes)" ), *Wave->GetName(), Buffer->BufferSize );
+			}
+		}
+	}
+
+	// Remove any buffers that failed to re-upload from the Buffers array
+	for( INT i = Buffers.Num() - 1; i >= 0; i-- )
+	{
+		if( Buffers(i)->BufferIds[0] == 0 )
+		{
+			// Also clear the resource ID on the corresponding wave so it
+			// can be re-created later
+			for( TObjectIterator<USoundNodeWave> It; It; ++It )
+			{
+				if( (*It)->ResourceID == Buffers(i)->ResourceID )
+				{
+					(*It)->ResourceID = 0;
+					break;
+				}
+			}
+			delete Buffers(i);
+			Buffers.Remove( i );
+		}
+	}
+
+	debugf( NAME_DevAudio, TEXT( "ALAudio: Buffer re-upload complete. %d buffers active." ), Buffers.Num() );
+}
+
+/**
+ * Attempts to fully recover the OpenAL device after a disconnect.
+ * Called each frame from Update() when bDeviceLost is TRUE and
+ * no recovery is currently in progress.
+ */
+void UALAudioDevice::AttemptDeviceRecovery( void )
+{
+	bRecovering = TRUE;
+	debugf( TEXT( "ALAudio: === Attempting device recovery === " ) );
+
+	// Step 1: Release old hardware
+	ReleaseALHardware();
+
+	// Step 2: Small delay to let the system stabilize
+	// (Windows may take a moment to fully switch default devices)
+	appSleep( 0.1f );
+
+	// Step 3: Recreate hardware with the new default device
+	if( !RecreateALHardware() )
+	{
+		debugf( NAME_Error, TEXT( "ALAudio: Recovery failed at hardware recreation — will retry next frame" ) );
+		bRecovering = FALSE;
+		// bDeviceLost remains TRUE so we'll try again next frame
+		return;
+	}
+
+	// Step 4: Re-upload all buffer data
+	ReuploadAllBuffers();
+
+	// Step 5: Reinitialize the effects manager on the new context
+	if( Effects )
+	{
+		delete Effects;
+		Effects = NULL;
+	}
+	Effects = new FAudioEffectsManager( this );
+
+	// Step 6: Recovery complete — clear flags
+	bDeviceLost = FALSE;
+	bRecovering = FALSE;
+
+	debugf( TEXT( "ALAudio: === Device recovery SUCCESSFUL === %d sources, %d buffers ready" ), 
+		Sources.Num(), Buffers.Num() );
+
+	// Mark all sources as free so the engine can start using them
+	FreeSources.Empty();
+	for( INT i = 0; i < Sources.Num(); i++ )
+	{
+		FALSoundSource* Source = (FALSoundSource*)Sources(i);
+		if( Source && Source->SourceId != 0 )
+		{
+			FreeSources.AddItem( Source );
+		}
+	}
+}
+
+#endif // _WINDOWS
+
+
 /*------------------------------------------------------------------------------------
 OpenAL utility functions
 ------------------------------------------------------------------------------------*/
@@ -647,12 +1236,22 @@ UBOOL UALAudioDevice::alError( const TCHAR* Text, UBOOL Log )
 
 /**
  * Initializes a source with a given wave instance and prepares it for playback.
+ * Skips OpenAL calls if the device is in a lost/recovering state.
  *
  * @param	WaveInstance	wave instace being primed for playback
  * @return	TRUE if initialization was successful, FALSE otherwise
  */
 UBOOL FALSoundSource::Init( FWaveInstance* InWaveInstance )
 {
+#if _WINDOWS
+	UALAudioDevice* ALDevice = (UALAudioDevice*)AudioDevice;
+	// Don't attempt source init during device loss or recovery
+	if( ALDevice->bRecovering || ALDevice->bDeviceLost )
+	{
+		return FALSE;
+	}
+#endif
+
 	// Find matching buffer.
 	Buffer = FALSoundBuffer::Init( InWaveInstance->WaveData, ( UALAudioDevice * )AudioDevice );
 	if( Buffer )
@@ -695,7 +1294,16 @@ FALSoundSource::~FALSoundSource( void )
 	// @todo openal: What do we do here
 	/// AudioDevice->DestroyEffect( this );
 
+#if _WINDOWS
+	UALAudioDevice* ALDevice = (UALAudioDevice*)AudioDevice;
+	// Only delete AL source if the device is valid (not lost)
+	if( !ALDevice->bRecovering && !ALDevice->bDeviceLost && SourceId != 0 )
+	{
+		alDeleteSources( 1, &SourceId );
+	}
+#else
 	alDeleteSources( 1, &SourceId );
+#endif
 }
 
 /**
@@ -710,6 +1318,14 @@ void FALSoundSource::Update( void )
 	{
 		return;
 	}
+
+#if _WINDOWS
+	UALAudioDevice* ALDevice = (UALAudioDevice*)AudioDevice;
+	if( ALDevice->bRecovering || ALDevice->bDeviceLost )
+	{
+		return;
+	}
+#endif
 
 	FLOAT Volume = WaveInstance->Volume * WaveInstance->VolumeMultiplier;
 	if( SetStereoBleed() )
@@ -770,7 +1386,15 @@ void FALSoundSource::Play( void )
 {
 	if( WaveInstance )
 	{
+#if _WINDOWS
+		UALAudioDevice* ALDevice = (UALAudioDevice*)AudioDevice;
+		if( !ALDevice->bRecovering && !ALDevice->bDeviceLost )
+		{
+			alSourcePlay( SourceId );
+		}
+#else
 		alSourcePlay( SourceId );
+#endif
 		Paused = FALSE;
 		Playing = TRUE;
 	}
@@ -783,9 +1407,19 @@ void FALSoundSource::Stop( void )
 {
 	if( WaveInstance )
 	{
+#if _WINDOWS
+		UALAudioDevice* ALDevice = (UALAudioDevice*)AudioDevice;
+		if( !ALDevice->bRecovering && !ALDevice->bDeviceLost )
+		{
+			alSourceStop( SourceId );
+			// This clears out any pending buffers that may or may not be queued or played
+			alSourcei( SourceId, AL_BUFFER, 0 );
+		}
+#else
 		alSourceStop( SourceId );
 		// This clears out any pending buffers that may or may not be queued or played
 		alSourcei( SourceId, AL_BUFFER, 0 );
+#endif
 		Paused = FALSE;
 		Playing = FALSE;
 		Buffer = NULL;
@@ -801,7 +1435,15 @@ void FALSoundSource::Pause( void )
 {
 	if( WaveInstance )
 	{
+#if _WINDOWS
+		UALAudioDevice* ALDevice = (UALAudioDevice*)AudioDevice;
+		if( !ALDevice->bRecovering && !ALDevice->bDeviceLost )
+		{
+			alSourcePause( SourceId );
+		}
+#else
 		alSourcePause( SourceId );
+#endif
 		Paused = TRUE;
 	}
 }
@@ -812,6 +1454,14 @@ void FALSoundSource::Pause( void )
 UBOOL FALSoundSource::IsSourceFinished( void )
 {
 	ALint State = AL_STOPPED;
+
+#if _WINDOWS
+	UALAudioDevice* ALDevice = (UALAudioDevice*)AudioDevice;
+	if( ALDevice->bRecovering || ALDevice->bDeviceLost )
+	{
+		return TRUE; // Treat as finished if device is lost
+	}
+#endif
 
 	// Check the source for data to continue playing
 	alGetSourcei( SourceId, AL_SOURCE_STATE, &State );
@@ -859,6 +1509,13 @@ UBOOL FALSoundSource::IsFinished( void )
 		}
 		else 
 		{
+#if _WINDOWS
+			UALAudioDevice* ALDevice = (UALAudioDevice*)AudioDevice;
+			if( ALDevice->bRecovering || ALDevice->bDeviceLost )
+			{
+				return TRUE;
+			}
+#endif
 			// Check to see if any complete buffers have been processed
 			ALint BuffersProcessed;
 			alGetSourcei( SourceId, AL_BUFFERS_PROCESSED, &BuffersProcessed );
@@ -916,8 +1573,15 @@ FALSoundBuffer::~FALSoundBuffer( void )
 		AudioDevice->WaveBufferMap.Remove( ResourceID );
 	}
 
-	// Delete AL buffers.
+	// Delete AL buffers only if the device is still valid
+#if _WINDOWS
+	if( !AudioDevice->bRecovering && !AudioDevice->bDeviceLost )
+	{
+		alDeleteBuffers( 1, BufferIds );
+	}
+#else
 	alDeleteBuffers( 1, BufferIds );
+#endif
 }
 
 /**
@@ -937,6 +1601,14 @@ FALSoundBuffer* FALSoundBuffer::Init( USoundNodeWave* Wave, UALAudioDevice* Audi
 	{
 		return( NULL );
 	}
+
+#if _WINDOWS
+	// Don't create buffers during device loss or recovery
+	if( AudioDevice->bRecovering || AudioDevice->bDeviceLost )
+	{
+		return NULL;
+	}
+#endif
 
 	FALSoundBuffer* Buffer = NULL;
 

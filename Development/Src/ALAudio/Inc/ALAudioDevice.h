@@ -30,6 +30,35 @@ class UALAudioDevice;
 #pragma pack (pop)
 #endif
 #define AL_DLL TEXT("OpenAL32.dll")
+
+// Windows audio endpoint notification interfaces
+interface IMMDeviceEnumerator;
+interface IMMNotificationClient;
+
+// MIDL_INTERFACE for IMMNotificationClient
+#undef  INTERFACE
+#define INTERFACE IMMNotificationClient
+DECLARE_INTERFACE_(IMMNotificationClient, IUnknown)
+{
+	STDMETHOD(OnDeviceStateChanged)(THIS_ LPCWSTR pwstrDeviceId, DWORD dwNewState) PURE;
+	STDMETHOD(OnDeviceAdded)(THIS_ LPCWSTR pwstrDeviceId) PURE;
+	STDMETHOD(OnDeviceRemoved)(THIS_ LPCWSTR pwstrDeviceId) PURE;
+	STDMETHOD(OnDefaultDeviceChanged)(THIS_ EDataFlow flow, ERole role, LPCWSTR pwstrDefaultDeviceId) PURE;
+	STDMETHOD(OnPropertyValueChanged)(THIS_ LPCWSTR pwstrDeviceId, const PROPERTYKEY key) PURE;
+};
+
+// MIDL_INTERFACE for IMMDeviceEnumerator
+#undef  INTERFACE
+#define INTERFACE IMMDeviceEnumerator
+DECLARE_INTERFACE_(IMMDeviceEnumerator, IUnknown)
+{
+	STDMETHOD(EnumAudioEndpoints)(THIS_ EDataFlow dataFlow, DWORD dwStateMask, IMMDeviceCollection** ppDevices) PURE;
+	STDMETHOD(GetDefaultAudioEndpoint)(THIS_ EDataFlow dataFlow, ERole role, IMMDevice** ppEndpoint) PURE;
+	STDMETHOD(GetDevice)(THIS_ LPCWSTR pwstrId, IMMDevice** ppDevice) PURE;
+	STDMETHOD(RegisterEndpointNotificationCallback)(THIS_ IMMNotificationClient* pClient) PURE;
+	STDMETHOD(UnregisterEndpointNotificationCallback)(THIS_ IMMNotificationClient* pClient) PURE;
+};
+
 #else
 
 #error Your platform defines here
@@ -41,6 +70,37 @@ class UALAudioDevice;
 #endif
 
 extern FLOAT GALGlobalVolumeMultiplier;
+
+#if _WINDOWS
+/**
+ * IMMNotificationClient implementation to handle audio device arrival/removal
+ * and default device changes on Windows. When a device change is detected, it
+ * flags the owning UALAudioDevice for recovery.
+ */
+class FALAudioNotificationClient : public IMMNotificationClient
+{
+public:
+	FALAudioNotificationClient( class UALAudioDevice* InDevice );
+
+	// IUnknown interface
+	HRESULT STDMETHODCALLTYPE QueryInterface( REFIID Iid, void** OutObject );
+	ULONG STDMETHODCALLTYPE AddRef();
+	ULONG STDMETHODCALLTYPE Release();
+
+	// IMMNotificationClient interface
+	HRESULT STDMETHODCALLTYPE OnDeviceStateChanged( LPCWSTR DeviceId, DWORD NewState );
+	HRESULT STDMETHODCALLTYPE OnDeviceAdded( LPCWSTR DeviceId );
+	HRESULT STDMETHODCALLTYPE OnDeviceRemoved( LPCWSTR DeviceId );
+	HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged( EDataFlow Flow, ERole Role, LPCWSTR DefaultDeviceId );
+	HRESULT STDMETHODCALLTYPE OnPropertyValueChanged( LPCWSTR DeviceId, const PROPERTYKEY Key );
+
+private:
+	/** The audio device to notify on device changes */
+	class UALAudioDevice*	AudioDevice;
+	/** Reference count for COM */
+	LONG					RefCount;
+};
+#endif // _WINDOWS
 
 /**
  * OpenAL implementation of FSoundBuffer, containing the wave data and format information.
@@ -192,7 +252,8 @@ protected:
 };
 
 /**
- * OpenAL implementation of an Unreal audio device.
+ * OpenAL implementation of an Unreal audio device. On Windows, supports device
+ * lost detection and automatic recovery via IMMNotificationClient.
  */
 class UALAudioDevice : public UAudioDevice
 {
@@ -225,7 +286,8 @@ class UALAudioDevice : public UAudioDevice
 
 	/**
 	 * Update the audio device and calculates the cached inverse transform later
-	 * on used for spatialization.
+	 * on used for spatialization. Also checks for device lost and triggers
+	 * recovery on Windows.
 	 *
 	 * @param	Realtime	whether we are paused or not
 	 */
@@ -282,11 +344,70 @@ protected:
 	 */
 	void Teardown( void );
 
+#if _WINDOWS
+	// ---- Device lost detection and recovery (Windows) ----
+
+	/**
+	 * Initializes the COM MMDeviceEnumerator and registers for endpoint
+	 * notification callbacks. Called from Init() on Windows.
+	 */
+	void InitDeviceNotification( void );
+
+	/**
+	 * Unregisters notification callbacks and releases COM interfaces.
+	 * Called from FinishDestroy() on Windows.
+	 */
+	void ShutdownDeviceNotification( void );
+
+	/**
+	 * Called each frame from Update() to check whether the OpenAL device
+	 * has been disconnected. If disconnected, sets bDeviceLost = TRUE.
+	 */
+	void CheckDeviceLost( void );
+
+	/**
+	 * Called when the notification client detects a new default device or
+	 * when the original device becomes active again. Attempts to fully
+	 * recover the OpenAL device, context, sources, and buffers.
+	 */
+	void AttemptDeviceRecovery( void );
+
+	/**
+	 * Releases the OpenAL device and context without tearing down
+	 * the Unreal-side source/buffer data structures. Used during
+	 * device loss to gracefully detach from the hardware.
+	 */
+	void ReleaseALHardware( void );
+
+	/**
+	 * Re-opens the OpenAL device and context, and recreates all
+	 * AL sources. Buffers are re-uploaded from cached wave data.
+	 */
+	UBOOL RecreateALHardware( void );
+
+	/**
+	 * Re-uploads all cached FALSoundBuffer data to the new OpenAL
+	 * context after recovery.
+	 */
+	void ReuploadAllBuffers( void );
+
+	/** COM interface for device enumeration, used to register callbacks */
+	IMMDeviceEnumerator*		MMDeviceEnumerator;
+	/** COM callback object for device change notifications */
+	FALAudioNotificationClient*	NotificationClient;
+	/** Set to TRUE when the OpenAL device has been lost and needs recovery */
+	UBOOL						bDeviceLost;
+	/** Set to TRUE while recovery is in progress to suppress calls to
+	 *  OpenAL functions that would fail on an invalid context */
+	UBOOL						bRecovering;
+#endif // _WINDOWS
+
 	// Variables.
 
 	/** The name of the OpenAL Device to open - defaults to "Generic Software" */
 	FStringNoInit								DeviceName;
-	/** All loaded resident buffers */
+	/** All loaded resident buffers - NOTE: during device loss, AL buffer IDs
+	 *  within these objects become invalid and will be re-generated on recovery */
 	TArray<FALSoundBuffer*>						Buffers;
 	/** Map from resource ID to sound buffer */
 	TMap<INT, FALSoundBuffer*>					WaveBufferMap;
@@ -306,6 +427,7 @@ protected:
 	ALenum										Surround71Format;
 
 	friend class FALSoundBuffer;
+	friend class FALAudioNotificationClient;
 };
 
 #endif
