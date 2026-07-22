@@ -4189,7 +4189,7 @@ void InitializeRegistrantsAndRegisterNames()
 	AutoInitializeRegistrantsIpDrv( Lookup );
 #endif	//#if WITH_UE3_NETWORKING
 #if !PS3 && !MOBILE && !PLATFORM_MACOSX && !WIIU
-	AutoInitializeRegistrantsXAudio2( Lookup );
+	AutoInitializeRegistrantsALAudio( Lookup );
 #endif
 #if PLATFORM_MACOSX
 	AutoInitializeRegistrantsCoreAudio( Lookup );
