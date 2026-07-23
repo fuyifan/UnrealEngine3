@@ -213,6 +213,17 @@ namespace UnrealBuildTool
 				FinalLinkEnvironment.LibraryPaths.Add( "../External/EasyHook/" );
 			}
 
+			// Compile and link with XAudio2 Redist (NuGet package)
+			GlobalCPPEnvironment.SystemIncludePaths.Add( "../External/XAudio2Redist/1.2.13/build/native/include" );
+			if( Platform == UnrealTargetPlatform.Win64 )
+			{
+				FinalLinkEnvironment.LibraryPaths.Add( "../External/XAudio2Redist/1.2.13/build/native/release/lib/x64" );
+			}
+			else
+			{
+				FinalLinkEnvironment.LibraryPaths.Add( "../External/XAudio2Redist/1.2.13/build/native/release/lib/x86" );
+			}
+
 			// Compile and link with DirectX.
 			GlobalCPPEnvironment.SystemIncludePaths.Add( "$(DXSDK_DIR)/include" );
 			if( Platform == UnrealTargetPlatform.Win64 )
@@ -278,8 +289,9 @@ namespace UnrealBuildTool
 
 			// Required for 3D spatialisation in XAudio2
             FinalLinkEnvironment.AdditionalLibraries.Add( "X3DAudio.lib" );
-            FinalLinkEnvironment.AdditionalLibraries.Add( "xapobase.lib" );
+            FinalLinkEnvironment.AdditionalLibraries.Add( "xapobaseredist.lib" );
             FinalLinkEnvironment.AdditionalLibraries.Add( "XAPOFX.lib" );
+            FinalLinkEnvironment.AdditionalLibraries.Add( "xaudio2_9redist.lib" );
 
 			// OpenAL - ALAudio backend
 			FinalLinkEnvironment.AdditionalLibraries.Add( "OpenAL32.lib" );
