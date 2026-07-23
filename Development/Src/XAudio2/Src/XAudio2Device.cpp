@@ -247,12 +247,6 @@ UBOOL UXAudio2Device::InitHardware( void )
 		}
 #endif
 
-#if _WIN64
-		// Work around the fact the x64 version of XAudio2_7.dll does not properly ref count
-		// by forcing it to be always loaded
-		LoadLibraryA( "XAudio2_7.dll" );
-#endif
-
 		UINT32 Flags = 0;	// XAUDIO2_DEBUG_ENGINE;
 		if( XAudio2Create( &XAudio2, Flags, AUDIO_HWTHREAD ) != S_OK )
 		{
